@@ -1,0 +1,151 @@
+#!/bin/bash
+
+# Exit on command errors and treat unset variables as an error
+set -eu
+
+# IMPORT GENERIC HELPERS
+#=================================================
+
+source _common.sh
+source /usr/share/yunohost/helpers
+
+# App variable
+
+app=$YNH_APP_INSTANCE_NAME
+
+# Retrieve arguments
+domain=$YNH_APP_ARG_DOMAIN
+is_public=$YNH_APP_ARG_DOMAIN
+
+# Save app settings
+
+ynh_app_setting_set $app is_public $is_public
+ynh_app_setting_set $app domain $domain
+
+# Check domain/path availability
+sudo yunohost app checkurl $domain -a "$app" \
+    || ynh_die "Domain not available: ${domain}${path_url}"
+
+
+ori_path=$(pwd)
+final_path=/var/www/diaspora
+full_url=https://$domain
+
+sudo yunohost app setting diaspora final_path -v $final_path
+
+# Get sys deps
+sudo curl -sL https://deb.nodesource.com/setup_7.x | sudo bash -
+sudo apt-get install -yy -qq nodejs
+sudo apt-get update
+sudo apt-get install -y -- \
+ gawk libyaml-dev libsqlite3-dev sqlite3 autoconf libgdbm-dev libncurses5-dev automake bison libffi-dev \
+ build-essential libssl-dev libcurl4-openssl-dev libxml2-dev libxslt-dev imagemagick ghostscript git curl libmysqlclient-dev \
+ libmagickwand-dev redis-server
+
+# Get source code
+git clone -b master https://github.com/diaspora/diaspora
+
+echo $(pwd)
+
+sudo mkdir -p $final_path
+tar -cf source.tar.gz diaspora/
+mv source.tar.gz diaspora/public/source.tar.gz
+sudo cp -ar diaspora $final_path/../.
+
+### MySQL ###
+# If your app use a MySQL database you can use these lines to bootstrap
+# a database, an associated user and save the password in app settings.
+
+# # Generate MySQL password and create database
+dbuser=$app
+dbname=$app
+dbpass=$(ynh_string_random 12)
+ynh_app_setting_set "$app" mysqlpwd "$dbpass"
+ynh_mysql_create_db "$dbname" "$dbuser" "$dbpass"
+
+# # Load initial SQL into the new database
+ynh_mysql_connect_as "$dbuser" "$dbpass" "$dbname" \
+   < "../sources/sql/mysql.init.sql"
+### MySQL end ###
+
+
+
+# prepare and copy diaspora config file
+sed -i "s@FULLURLTOCHANGE@$full_url@g" ../conf/diaspora.yml
+sed -i "s@DBUSERTOCHANGE@$db_user@g" ../conf/database.yml
+sed -i "s@DBPASSTOCHANGE@$db_pwd@g" ../conf/database.yml
+sudo cp ../conf/diaspora.yml $final_path/config/
+sudo cp ../conf/database.yml $final_path/config/
+
+# Install startup script
+sudo cp ../conf/diaspora_ynh /etc/init.d/diaspora_ynh
+sudo chmod 754 /etc/init.d/diaspora_ynh
+sudo update-rc.d diaspora_ynh defaults
+
+# Create and config user
+sudo adduser --gecos "First Last,RoomNumber,WorkPhone,HomePhone" --disabled-login --quiet --home $final_path diaspora
+sudo chown -R diaspora:diaspora $final_path
+
+# Config RVM and force get app deps (for debug) and add hack for installation
+sudo su - diaspora -c "curl --retry 5 -sSL https://rvm.io/mpapis.asc | gpg --import - ; curl --retry 5 -L dspr.tk/1t | bash;"
+sudo su - diaspora -c "curl --retry 5 -sSL https://s.diaspora.software/1t | sed 's# bash # sed \"s/noexec/noexechack/g\" | bash #g' | bash ;"
+
+# Add user to sudoers for install
+DIASPORASUDOERSCONF="diaspora ALL=(ALL:ALL) NOPASSWD: ALL #yunhost_diaspora"
+sudo cat /etc/sudoers | grep yunhost_diaspora -q
+if [ $? != 0 ]
+then
+    sudo su -c "echo '$DIASPORASUDOERSCONF' >> /etc/sudoers"
+fi
+
+sudo su - diaspora -c "rvm install 2.3"
+sudo su - diaspora -c "env REALLY_GEM_UPDATE_SYSTEM=1 gem update --system --no-user-install"
+sudo su - diaspora -c "x=1; RET=1; while [ \$x -le 5 ] && [ \"\$RET\" != 0 ] ; do gem install bundler ; RET=\$? ; x=\$(( \$x + 1 )) ; done"
+
+# Remove user from sudoers
+sudo cat /etc/sudoers | grep yunhost_diaspora -q
+if [ $? == 0 ]
+then
+    sudo sed -i '/yunhost_diaspora/d' /etc/sudoers
+fi
+
+# construct diaspora app
+#sudo su - diaspora -c "RAILS_ENV=production bundle install --without test development --with mysql --retry 10"
+#sudo su - diaspora -c "RAILS_ENV=production bundle exec rake db:create db:schema:load"
+#sudo su - diaspora -c "RAILS_ENV=production bundle exec rake assets:precompile"
+sudo su - diaspora -c "RAILS_ENV=production bin/bundle install --jobs $(nproc) --deployment --without test development --with mysql --retry 10"
+sudo su - diaspora -c "RAILS_ENV=production bin/rake db:create db:schema:load"
+sudo su - diaspora -c "RAILS_ENV=production bin/rake assets:precompile"
+
+cd $ori_path
+
+# Debug foreman module and start service
+sudo mv $final_path/.profile $final_path/.profile.bak
+sudo service diaspora_ynh start
+
+# Install home page
+sudo cp ../conf/_show.html.haml $final_path/app/views/home/_show.html.haml
+
+# config nginx
+cat /etc/nginx/conf.d/$domain.conf | grep -q "diaspora_server"
+if [ $? != 0 ]
+then
+	sudo su - -c "cat $ori_path/../conf/nginx_upstream.conf >>/etc/nginx/conf.d/$domain.conf"
+fi
+
+sed -i "s@PATHTOCHANGE@$path@g" ../conf/nginx.conf
+sed -i "s@ROOTOCHANGE@$final_path/@g" ../conf/nginx.conf
+sudo cp ../conf/nginx.conf /etc/nginx/conf.d/$domain.d/diaspora.conf
+
+# Reload Nginx and regenerate SSOwat conf
+
+sudo service nginx reload
+sudo yunohost app setting diaspora skipped_uris -v "/"
+sudo yunohost app ssowatconf
+
+# Protect URIs
+if [ $is_public = "no" -o $is_public = "NO" -o $is_public = "No" ]
+then
+    sudo yunohost app setting diaspora protected_uris -v "/"
+    sudo yunohost app ssowatconf
+fi
