@@ -24,7 +24,7 @@ Pour installer cette app il faut :
 
 Diaspora integration for YunoHost
 
-ETAT = IN PROGRESS
+ETAT=IN PROGRESS
 
 Do not install this app in production
 
